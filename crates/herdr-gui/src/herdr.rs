@@ -3,13 +3,25 @@ use serde_json::{json, Value};
 use std::{
     env,
     io::{BufRead, BufReader, Write},
-    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
+
+#[cfg(unix)]
+fn connect(path: &Path) -> std::io::Result<std::os::unix::net::UnixStream> {
+    std::os::unix::net::UnixStream::connect(path)
+}
+
+// Herdr on Windows serves its API on a named pipe named after the socket path.
+#[cfg(windows)]
+fn connect(path: &Path) -> std::io::Result<interprocess::local_socket::Stream> {
+    use interprocess::local_socket::{prelude::*, GenericNamespaced};
+    let name = path.to_string_lossy().to_string();
+    interprocess::local_socket::Stream::connect(name.to_ns_name::<GenericNamespaced>()?)
+}
 
 #[derive(Debug, Error)]
 pub enum HerdrError {
@@ -191,7 +203,18 @@ pub struct HerdrClient {
     socket_path: PathBuf,
 }
 
+/// Set by the Windows snapshot child so 10 calls/s do not flood the log or its pty.
+pub static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl HerdrClient {
+    /// Client for an already-running server, without the install/start checks.
+    #[cfg(windows)]
+    pub fn existing() -> Self {
+        Self {
+            socket_path: socket_path(),
+        }
+    }
+
     pub fn bootstrap() -> Result<Self, HerdrError> {
         ensure_herdr_installed()?;
         let socket_path = socket_path();
@@ -314,8 +337,8 @@ impl HerdrClient {
         Ok(())
     }
 
-    pub fn create_workspace(&self) -> Result<(), HerdrError> {
-        let _: Value = self.call("workspace.create", json!({ "focus": true }))?;
+    pub fn create_workspace(&self, cwd: Option<&str>) -> Result<(), HerdrError> {
+        let _: Value = self.call("workspace.create", json!({ "focus": true, "cwd": cwd }))?;
         Ok(())
     }
 
@@ -365,7 +388,7 @@ impl HerdrClient {
 
     fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T, HerdrError> {
         let started = Instant::now();
-        let mut stream = UnixStream::connect(&self.socket_path).map_err(|err| {
+        let mut stream = connect(&self.socket_path).map_err(|err| {
             HerdrError::SocketUnavailable(self.socket_path.display().to_string(), err.to_string())
         })?;
         let request = json!({ "id": "herdr-gui", "method": method, "params": params });
@@ -392,6 +415,9 @@ impl HerdrClient {
 
 fn lag_log(args: std::fmt::Arguments<'_>) {
     use std::io::Write;
+    if QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
@@ -401,7 +427,7 @@ fn lag_log(args: std::fmt::Arguments<'_>) {
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/herdr-gui-lag.log")
+        .open(env::temp_dir().join("herdr-gui-lag.log"))
     {
         let _ = writeln!(file, "{line}");
         let _ = file.flush();
@@ -422,9 +448,38 @@ fn ensure_herdr_installed() -> Result<(), HerdrError> {
     }
 }
 
+/// Keeps helper processes from opening a console window next to the GUI.
+fn hidden(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    command
+}
+
+/// Starts an agent CLI in `pane_id`. Detached: `herdr agent start` blocks until the
+/// agent is ready, and the pane itself shows any failure.
+pub fn start_agent(kind: &str, pane_id: &str) -> Result<(), HerdrError> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() % 100_000)
+        .unwrap_or(0);
+    let name = format!("{kind}-{stamp}");
+    hidden(Command::new("herdr").args([
+        "agent", "start", &name, "--kind", kind, "--pane", pane_id,
+    ]))
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()?;
+    Ok(())
+}
+
 fn command_exists(command: &str) -> bool {
-    Command::new("sh")
-        .args(["-c", &format!("command -v {command}")])
+    // No `sh` on stock Windows; running the binary itself works everywhere.
+    hidden(Command::new(command).arg("--version"))
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -432,8 +487,7 @@ fn command_exists(command: &str) -> bool {
 }
 
 fn start_server() -> Result<(), HerdrError> {
-    Command::new("herdr")
-        .arg("server")
+    hidden(Command::new("herdr").arg("server"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -442,8 +496,13 @@ fn start_server() -> Result<(), HerdrError> {
 }
 
 fn wait_for_socket(path: &Path) -> Result<(), HerdrError> {
-    for _ in 0..30 {
-        if path.exists() {
+    // Ping rather than check the path: a stopped server leaves its socket marker
+    // file behind (always on Windows), so the path existing proves nothing.
+    let client = HerdrClient {
+        socket_path: path.to_path_buf(),
+    };
+    for _ in 0..50 {
+        if client.ping().is_ok() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
@@ -458,16 +517,20 @@ fn socket_path() -> PathBuf {
     if let Some(path) = env::var_os("HERDR_SOCKET_PATH") {
         return PathBuf::from(path);
     }
-    let home = env::var_os("HOME")
+    #[cfg(windows)]
+    let config_dir = env::var_os("APPDATA")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("herdr");
+    #[cfg(not(windows))]
+    let config_dir = env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config/herdr");
     if let Some(session) = env::var_os("HERDR_SESSION") {
-        return home
-            .join(".config/herdr/sessions")
-            .join(session)
-            .join("herdr.sock");
+        return config_dir.join("sessions").join(session).join("herdr.sock");
     }
-    home.join(".config/herdr/herdr.sock")
+    config_dir.join("herdr.sock")
 }
 
 #[cfg(test)]

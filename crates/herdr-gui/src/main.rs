@@ -8,9 +8,11 @@ mod theme;
 
 use crepuscularity_gpui as gpui;
 use crepuscularity_gpui::prelude::*;
+#[cfg(target_os = "macos")]
+use crepuscularity_gpui::Icon;
 use crepuscularity_gpui::{
     actions, bounce, bounds, div, gpui_window_options, linear, point, px, rgb, size, AnyElement,
-    AnyView, AnyWindowHandle, App, Application, Context, Entity, FocusHandle, Icon, IntoElement,
+    AnyView, AnyWindowHandle, App, Application, Context, Entity, FocusHandle, IntoElement,
     KeyBinding, Keystroke, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Render, ScrollDelta, ScrollWheelEvent, SystemMenuType, TitlebarOptions,
     TouchPhase, Window, WindowAppearance, WindowBounds,
@@ -201,6 +203,14 @@ const MACOS_TITLEBAR_HEIGHT: f64 = 28.0;
 #[cfg(not(target_os = "macos"))]
 const MACOS_TITLEBAR_HEIGHT: f64 = 0.0;
 const TOP_TAB_BAR_HEIGHT: f64 = 34.0;
+/// Tab-bar launch buttons: (label, `herdr agent start --kind`). Each opens a new tab.
+const AGENT_LAUNCHERS: [(&str, &str); 5] = [
+    ("Claude", "claude"),
+    ("Codex", "codex"),
+    ("opencode", "opencode"),
+    ("agy", "agy"),
+    ("Muse", "muse"),
+];
 /// macOS traffic-light cluster width + inset; keeps Arc top tabs aligned with sidebar.
 const TRAFFIC_LIGHT_INSET_X: f64 = 78.0;
 /// Vertical inset under unified titlebar (sidebar + tab row).
@@ -219,6 +229,20 @@ impl HerdrGui {
             },
             Err(err) => (None, HerdrState::default(), err.to_string()),
         };
+        // ponytail: poll Herdr every 2s so agent status and new tabs show without a click;
+        // replace with event subscription once Herdr's is stable (see TODO.md).
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            let alive = this.update(cx, |view, cx| {
+                view.refresh_state();
+                view.notify_sidebar(cx);
+                cx.notify();
+            });
+            if alive.is_err() {
+                break;
+            }
+        })
+        .detach();
         let settings = settings::Settings::load();
         let sidebar_layout = match settings.sidebar_layout.as_str() {
             "warp" => SidebarLayout::Warp,
@@ -520,11 +544,25 @@ impl HerdrGui {
 
     fn new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
         let workspace_id = self.active_workspace_id().map(str::to_string);
+        if workspace_id.is_none() {
+            // Nothing to add a tab to yet: the first tab is a new workspace.
+            return self.new_workspace(&NewWorkspace, window, cx);
+        }
         self.with_client(|client| client.create_tab(workspace_id.as_deref()));
         self.refresh_state();
         self.attach_focused_terminal(window, cx);
         self.notify_sidebar(cx);
         cx.notify();
+    }
+
+    fn launch_agent(&mut self, kind: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_tab(&NewTab, window, cx);
+        let Some(pane_id) = self.focused_pane().map(|pane| pane.pane_id.clone()) else {
+            return;
+        };
+        if let Err(err) = herdr::start_agent(kind, &pane_id) {
+            self.status = err.to_string();
+        }
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -538,7 +576,8 @@ impl HerdrGui {
     }
 
     fn new_workspace(&mut self, _: &NewWorkspace, window: &mut Window, cx: &mut Context<Self>) {
-        self.with_client(HerdrClient::create_workspace);
+        let cwd = Some(self.settings.projects_dir.clone()).filter(|dir| !dir.is_empty());
+        self.with_client(|client| client.create_workspace(cwd.as_deref()));
         self.refresh_state();
         self.attach_focused_terminal(window, cx);
         cx.notify();
@@ -847,7 +886,8 @@ impl HerdrGui {
             return;
         }
         self.reset_terminal_scroll_state();
-        match TerminalSession::attach(&target, size.0, size.1) {
+        let pane_id = pane.as_ref().map(|pane| pane.pane_id.as_str()).unwrap_or(&target);
+        match TerminalSession::attach(&target, pane_id, size.0, size.1) {
             Ok(mut session) => {
                 if let Ok(frame) = session.resize(size.0, size.1, size.2, size.3) {
                     self.set_terminal_frame(Arc::new(frame), cx);
@@ -1736,6 +1776,21 @@ impl HerdrGui {
                     )
                     .child(icon("plus", 13.0, theme)),
             )
+            .children(AGENT_LAUNCHERS.iter().map(|&(label, kind)| {
+                div()
+                    .h_full()
+                    .px(px(10.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(rgb(theme.hover)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| this.launch_agent(kind, window, cx)),
+                    )
+                    .child(ui_text(label, 12, theme.label, false, ""))
+            }))
     }
 
     fn close_tab_by_id(&mut self, tab_id: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -1920,7 +1975,7 @@ fn lag_log(args: std::fmt::Arguments<'_>) {
             let Ok(mut file) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("/tmp/herdr-gui-lag.log")
+                .open(std::env::temp_dir().join("herdr-gui-lag.log"))
             else {
                 return;
             };
@@ -2017,6 +2072,22 @@ fn truncate_label(text: &str, max_chars: usize) -> String {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+fn icon(name: &'static str, size: f32, theme: UiTheme) -> impl IntoElement {
+    let glyph = match name {
+        "plus" => "+",
+        "xmark" => "\u{00d7}",
+        "chevron.down" => "\u{25be}",
+        "chevron.up" => "\u{25b4}",
+        _ => "\u{2022}",
+    };
+    div()
+        .text_size(px(size + 2.0))
+        .text_color(rgb(theme.label))
+        .child(glyph)
+}
+
+#[cfg(target_os = "macos")]
 fn icon(name: &'static str, size: f32, theme: UiTheme) -> impl IntoElement {
     Icon::new(name)
         .size(px(size))
@@ -2333,7 +2404,61 @@ fn empty_state(status: &str, theme: UiTheme) -> impl IntoElement {
     view_file!("ui/widgets.crepus#EmptyState")
 }
 
+/// Windows stand-in for `herdr terminal attach`: repaint the pane's visible snapshot
+/// whenever it changes. Runs as a child process inside the GUI's pty.
+// ponytail: 100ms polling of whole-screen snapshots, no scrollback and no real cursor
+// position; switch to `herdr terminal attach` once Herdr supports it on Windows.
+#[cfg(windows)]
+fn snapshot_loop(pane_id: &str) {
+    use std::io::Write;
+    herdr::QUIET.store(true, std::sync::atomic::Ordering::Relaxed);
+    let client = HerdrClient::existing();
+    let mut last = String::new();
+    let mut failures = 0;
+    while failures < 50 {
+        match client.read_pane_ansi(pane_id) {
+            Ok(ansi) => {
+                failures = 0;
+                if ansi != last {
+                    let mut out = std::io::stdout().lock();
+                    let body = ansi.trim_end().replace("\r\n", "\n").replace('\n', "\r\n");
+                    if write!(out, "\x1b[H\x1b[2J{body}").and_then(|_| out.flush()).is_err() {
+                        return;
+                    }
+                    last = ansi;
+                }
+            }
+            Err(err) => {
+                failures += 1;
+                if failures == 10 {
+                    println!("
+herdr-gui: lost connection to herdr: {err}");
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(windows)]
+extern "system" {
+    fn FreeConsole() -> i32;
+}
+
 fn main() {
+    #[cfg(windows)]
+    {
+        let mut args = std::env::args().skip(1);
+        if args.next().as_deref() == Some("--snapshot-loop") {
+            if let Some(pane_id) = args.next() {
+                snapshot_loop(&pane_id);
+            }
+            return;
+        }
+        // Console-subsystem binary (the snapshot child needs stdout); drop the
+        // console window Explorer opens for the GUI itself.
+        unsafe { FreeConsole() };
+    }
     std::env::set_var("OS_ACTIVITY_MODE", "disable");
 
     Application::new().run(|cx: &mut App| {

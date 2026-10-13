@@ -74,12 +74,6 @@ const CELL_WIDE_SPACER_TAIL: u32 = 2;
 const CELL_WIDE_SPACER_HEAD: u32 = 3;
 const DEFAULT_FG: u32 = 0xc5ceda;
 
-#[repr(C)]
-struct GhosttyTerminalOptions {
-    cols: u16,
-    rows: u16,
-    max_scrollback: usize,
-}
 
 #[repr(C)]
 #[derive(Default)]
@@ -90,7 +84,7 @@ struct GhosttyColorRgb {
 }
 
 type GhosttyTerminalNew =
-    unsafe extern "C" fn(*const c_void, *mut GhosttyTerminalHandle, GhosttyTerminalOptions) -> i32;
+    unsafe extern "C" fn(*const c_void, *mut GhosttyTerminalHandle, u16, u16) -> i32;
 type GhosttyTerminalFree = unsafe extern "C" fn(GhosttyTerminalHandle);
 type GhosttyTerminalResize = unsafe extern "C" fn(GhosttyTerminalHandle, u16, u16, u32, u32) -> i32;
 type GhosttyTerminalVtWrite = unsafe extern "C" fn(GhosttyTerminalHandle, *const u8, usize);
@@ -118,7 +112,8 @@ extern "C" {
     fn ghostty_terminal_new(
         config: *const c_void,
         terminal: *mut GhosttyTerminalHandle,
-        options: GhosttyTerminalOptions,
+        cols: u16,
+        rows: u16,
     ) -> i32;
     fn ghostty_terminal_free(terminal: GhosttyTerminalHandle);
     fn ghostty_terminal_resize(
@@ -222,7 +217,7 @@ impl GhosttyRuntime {
 }
 
 impl TerminalSession {
-    pub fn attach(terminal_id: &str, cols: u16, rows: u16) -> Result<Self, String> {
+    pub fn attach(terminal_id: &str, pane_id: &str, cols: u16, rows: u16) -> Result<Self, String> {
         let runtime = GhosttyRuntime::detect()?;
         let api = runtime.load_api()?;
         let pty = native_pty_system()
@@ -233,8 +228,23 @@ impl TerminalSession {
                 pixel_height: 0,
             })
             .map_err(|err| err.to_string())?;
-        let mut command = CommandBuilder::new("herdr");
-        command.args(["terminal", "attach", terminal_id]);
+        // Herdr has no `terminal attach` on Windows yet, so re-exec ourselves as a
+        // child that prints pane snapshots into the pty (see `snapshot_loop` in main.rs).
+        #[cfg(windows)]
+        let command = {
+            let _ = terminal_id;
+            let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+            let mut command = CommandBuilder::new(exe);
+            command.args(["--snapshot-loop", pane_id]);
+            command
+        };
+        #[cfg(not(windows))]
+        let command = {
+            let _ = pane_id;
+            let mut command = CommandBuilder::new("herdr");
+            command.args(["terminal", "attach", terminal_id]);
+            command
+        };
         let mut child = pty
             .slave
             .spawn_command(command)
@@ -349,7 +359,12 @@ impl TerminalSession {
                 .master
                 .try_clone_reader()
                 .map_err(|err| err.to_string())?;
+            // ConPTY (PSEUDOCONSOLE_INHERIT_CURSOR) emits nothing until its startup
+            // cursor query (ESC[6n) is answered. The writer lives with the reader thread.
+            let mut writer = pty.master.take_writer().map_err(|err| err.to_string())?;
+            std::io::Write::write_all(&mut writer, b"[1;1R").map_err(|err| err.to_string())?;
             thread::spawn(move || {
+                let _writer = writer;
                 let mut buf = [0_u8; 8192];
                 loop {
                     match reader.read(&mut buf) {
@@ -423,15 +438,7 @@ impl GhosttyTerminal {
     fn new(api: Arc<GhosttyApi>, cols: u16, rows: u16) -> Result<Self, String> {
         let mut terminal = ptr::null_mut();
         let result = unsafe {
-            (api.terminal_new)(
-                ptr::null(),
-                &mut terminal,
-                GhosttyTerminalOptions {
-                    cols,
-                    rows,
-                    max_scrollback: 10_000,
-                },
-            )
+(api.terminal_new)(ptr::null(), &mut terminal, cols, rows)
         };
         if result != GHOSTTY_SUCCESS {
             return Err(format!("ghostty_terminal_new failed: {result}"));

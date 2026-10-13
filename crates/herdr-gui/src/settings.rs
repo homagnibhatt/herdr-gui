@@ -9,6 +9,9 @@ pub struct Settings {
     pub sidebar_collapsed: bool,
     pub show_spaces: bool,
     pub agents_collapsed: bool,
+    /// Folder new workspaces open in; empty means Herdr's default (home).
+    #[serde(default)]
+    pub projects_dir: String,
 }
 
 impl Settings {

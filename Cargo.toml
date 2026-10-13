@@ -22,18 +22,24 @@ unwrap_used = "deny"
 expect_used = "deny"
 
 [dependencies]
-crepuscularity-gpui = { version = "=0.5.5", features = ["macos", "symbols"] }
-gpui = "=0.2.2"
+crepuscularity-gpui = { version = "=0.5.5", features = ["macos"] }
 libc = "0.2"
 portable-pty = "0.9.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 
-[patch.crates-io]
-crepuscularity-gpui = { path = "../crepuscularity/crates/crepuscularity-gpui" }
-crepuscularity-core = { path = "../crepuscularity/crates/crepuscularity-core" }
-crepuscularity-runtime = { path = "../crepuscularity/crates/crepuscularity-runtime" }
+# SF Symbols only exist on macOS; gpui-symbols does not compile elsewhere.
+[target.'cfg(target_os = "macos")'.dependencies]
+crepuscularity-gpui = { version = "=0.5.5", features = ["symbols"] }
+
+# gpui's default windows-manifest feature collides with the manifest gpui-ce embeds.
+[target.'cfg(not(windows))'.dependencies]
+gpui = "=0.2.2"
+
+[target.'cfg(windows)'.dependencies]
+gpui = { version = "=0.2.2", default-features = false }
+interprocess = "2.4.2"
 
 [lints]
 workspace = true

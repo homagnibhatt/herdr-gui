@@ -2,3 +2,7 @@
 /dist/
 /vendor/ghostty/
 /vendor/ghostty-vt/lib/*.dylib
+/vendor/ghostty-vt/zig-out/*
+!/vendor/ghostty-vt/zig-out/lib/
+/vendor/ghostty-vt/zig-out/lib/*
+!/vendor/ghostty-vt/zig-out/lib/ghostty-vt-static.lib
