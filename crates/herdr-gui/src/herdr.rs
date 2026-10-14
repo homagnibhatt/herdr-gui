@@ -466,9 +466,9 @@ pub fn start_agent(kind: &str, pane_id: &str) -> Result<(), HerdrError> {
         .map(|d| d.as_secs() % 100_000)
         .unwrap_or(0);
     let name = format!("{kind}-{stamp}");
-    hidden(Command::new("herdr").args([
-        "agent", "start", &name, "--kind", kind, "--pane", pane_id,
-    ]))
+    hidden(
+        Command::new("herdr").args(["agent", "start", &name, "--kind", kind, "--pane", pane_id]),
+    )
     .stdin(Stdio::null())
     .stdout(Stdio::null())
     .stderr(Stdio::null())

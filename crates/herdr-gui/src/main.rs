@@ -886,7 +886,10 @@ impl HerdrGui {
             return;
         }
         self.reset_terminal_scroll_state();
-        let pane_id = pane.as_ref().map(|pane| pane.pane_id.as_str()).unwrap_or(&target);
+        let pane_id = pane
+            .as_ref()
+            .map(|pane| pane.pane_id.as_str())
+            .unwrap_or(&target);
         match TerminalSession::attach(&target, pane_id, size.0, size.1) {
             Ok(mut session) => {
                 if let Ok(frame) = session.resize(size.0, size.1, size.2, size.3) {
@@ -2422,7 +2425,10 @@ fn snapshot_loop(pane_id: &str) {
                 if ansi != last {
                     let mut out = std::io::stdout().lock();
                     let body = ansi.trim_end().replace("\r\n", "\n").replace('\n', "\r\n");
-                    if write!(out, "\x1b[H\x1b[2J{body}").and_then(|_| out.flush()).is_err() {
+                    if write!(out, "\x1b[H\x1b[2J{body}")
+                        .and_then(|_| out.flush())
+                        .is_err()
+                    {
                         return;
                     }
                     last = ansi;
@@ -2431,8 +2437,10 @@ fn snapshot_loop(pane_id: &str) {
             Err(err) => {
                 failures += 1;
                 if failures == 10 {
-                    println!("
-herdr-gui: lost connection to herdr: {err}");
+                    println!(
+                        "
+herdr-gui: lost connection to herdr: {err}"
+                    );
                 }
             }
         }

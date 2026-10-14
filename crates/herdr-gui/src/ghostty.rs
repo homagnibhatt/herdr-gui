@@ -1,4 +1,6 @@
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 use std::{
     ffi::c_void,
     ptr,
@@ -7,7 +9,6 @@ use std::{
         Arc,
     },
     thread,
-    time::{Duration, Instant},
 };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -73,7 +74,6 @@ const CELL_DATA_HAS_TEXT: u32 = 4;
 const CELL_WIDE_SPACER_TAIL: u32 = 2;
 const CELL_WIDE_SPACER_HEAD: u32 = 3;
 const DEFAULT_FG: u32 = 0xc5ceda;
-
 
 // The macOS/Linux archive in vendor/ghostty-vt/lib takes an options struct; the Windows
 // build comes from Herdr's newer vendored libghostty-vt, which takes cols/rows directly.
