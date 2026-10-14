@@ -75,6 +75,16 @@ const CELL_WIDE_SPACER_HEAD: u32 = 3;
 const DEFAULT_FG: u32 = 0xc5ceda;
 
 
+// The macOS/Linux archive in vendor/ghostty-vt/lib takes an options struct; the Windows
+// build comes from Herdr's newer vendored libghostty-vt, which takes cols/rows directly.
+#[cfg(not(windows))]
+#[repr(C)]
+struct GhosttyTerminalOptions {
+    cols: u16,
+    rows: u16,
+    max_scrollback: usize,
+}
+
 #[repr(C)]
 #[derive(Default)]
 struct GhosttyColorRgb {
@@ -83,8 +93,12 @@ struct GhosttyColorRgb {
     b: u8,
 }
 
+#[cfg(windows)]
 type GhosttyTerminalNew =
     unsafe extern "C" fn(*const c_void, *mut GhosttyTerminalHandle, u16, u16) -> i32;
+#[cfg(not(windows))]
+type GhosttyTerminalNew =
+    unsafe extern "C" fn(*const c_void, *mut GhosttyTerminalHandle, GhosttyTerminalOptions) -> i32;
 type GhosttyTerminalFree = unsafe extern "C" fn(GhosttyTerminalHandle);
 type GhosttyTerminalResize = unsafe extern "C" fn(GhosttyTerminalHandle, u16, u16, u32, u32) -> i32;
 type GhosttyTerminalVtWrite = unsafe extern "C" fn(GhosttyTerminalHandle, *const u8, usize);
@@ -109,11 +123,18 @@ type GhosttyRowCellsGet = unsafe extern "C" fn(GhosttyRowCellsHandle, u32, *mut 
 type GhosttyCellGet = unsafe extern "C" fn(GhosttyCell, u32, *mut c_void) -> i32;
 
 extern "C" {
+    #[cfg(windows)]
     fn ghostty_terminal_new(
         config: *const c_void,
         terminal: *mut GhosttyTerminalHandle,
         cols: u16,
         rows: u16,
+    ) -> i32;
+    #[cfg(not(windows))]
+    fn ghostty_terminal_new(
+        config: *const c_void,
+        terminal: *mut GhosttyTerminalHandle,
+        options: GhosttyTerminalOptions,
     ) -> i32;
     fn ghostty_terminal_free(terminal: GhosttyTerminalHandle);
     fn ghostty_terminal_resize(
@@ -437,8 +458,19 @@ impl Drop for TerminalSession {
 impl GhosttyTerminal {
     fn new(api: Arc<GhosttyApi>, cols: u16, rows: u16) -> Result<Self, String> {
         let mut terminal = ptr::null_mut();
+        #[cfg(windows)]
+        let result = unsafe { (api.terminal_new)(ptr::null(), &mut terminal, cols, rows) };
+        #[cfg(not(windows))]
         let result = unsafe {
-(api.terminal_new)(ptr::null(), &mut terminal, cols, rows)
+            (api.terminal_new)(
+                ptr::null(),
+                &mut terminal,
+                GhosttyTerminalOptions {
+                    cols,
+                    rows,
+                    max_scrollback: 10_000,
+                },
+            )
         };
         if result != GHOSTTY_SUCCESS {
             return Err(format!("ghostty_terminal_new failed: {result}"));
